@@ -1,7 +1,8 @@
 """
 cutter.py
 検出した区間リストをもとに動画をカット・結合するモジュール。
-ffmpeg が必要（sudo apt install ffmpeg）
+ffmpeg が必要。Windows の場合:
+  winget install Gyan.FFmpeg
 
 【ブロックノイズ対策】
 -c copy（ストリームコピー）は GOP 途中でカットするとブロックノイズが
@@ -31,17 +32,13 @@ def cut_and_merge(
         output_path: 出力動画のパス
         crf:         映像品質（0〜51。低いほど高品質・大容量。デフォルト: 18）
         preset:      エンコード速度プリセット（デフォルト: fast）
-                     ultrafast / superfast / veryfast / faster / fast /
-                     medium / slow / slower / veryslow
     """
     if not intervals:
         print("切り出す区間がありませんでした。人物が検出されなかった可能性があります。")
         return
 
-    # ffmpeg がインストールされているか確認
     _check_ffmpeg()
 
-    # 一時ディレクトリに区間ごとの動画を保存
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         segment_paths: list[Path] = []
@@ -56,18 +53,18 @@ def cut_and_merge(
             cmd = [
                 "ffmpeg",
                 "-y",                            # 上書き確認なし
-                "-ss", str(start),               # 入力シーク（高速）
+                "-ss", str(start),               # 入力シーク
                 "-i", video_path,                # 入力ファイル
                 "-t", str(duration),             # 切り出し長さ（秒）
                 # ── 映像: H.264 再エンコード ──────────────────────────
                 # -c copy だとキーフレーム以外でカットした際に
                 # ブロックノイズが出るため、必ず再エンコードする
                 "-c:v", "libx264",
-                "-crf", str(crf),                # 映像品質
-                "-preset", preset,               # エンコード速度
+                "-crf", str(crf),
+                "-preset", preset,
                 # セグメント先頭を必ず Iフレームにする
                 "-force_key_frames", "expr:eq(n,0)",
-                # ── 音声: AAC コピー or 変換 ─────────────────────────
+                # ── 音声: AAC ─────────────────────────────────────────
                 "-c:a", "aac",
                 "-b:a", "192k",
                 # タイムスタンプのずれを補正（結合時の音ズレ防止）
@@ -79,15 +76,14 @@ def cut_and_merge(
             _run(cmd)
             segment_paths.append(segment_path)
 
-        # concat リストファイルを作成（ffmpeg の結合用）
+        # concat リストファイルを作成
         concat_list = tmp / "concat.txt"
-        with concat_list.open("w") as f:
+        with concat_list.open("w", encoding="utf-8") as f:
             for seg in segment_paths:
-                # Windows パス対策でスラッシュに変換
+                # Windows パス対策でスラッシュに統一
                 f.write(f"file '{seg.as_posix()}'\n")
 
-        # セグメントを結合
-        # 各セグメントが Iフレーム始まりなので -c copy で問題なく結合できる
+        # 各セグメントが Iフレーム始まりなので -c copy で結合できる
         print("\nセグメントを結合しています...")
         merge_cmd = [
             "ffmpeg",
@@ -95,7 +91,7 @@ def cut_and_merge(
             "-f", "concat",
             "-safe", "0",
             "-i", str(concat_list),
-            "-c", "copy",            # 結合のみ、再エンコードなし（高速）
+            "-c", "copy",
             output_path,
         ]
         _run(merge_cmd)
@@ -106,16 +102,13 @@ def cut_and_merge(
 def _check_ffmpeg() -> None:
     """ffmpeg がインストールされているか確認する。"""
     try:
-        subprocess.run(
-            ["ffmpeg", "-version"],
-            capture_output=True,
-            check=True,
-        )
+        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
     except FileNotFoundError:
         raise EnvironmentError(
             "ffmpeg が見つかりません。\n"
-            "以下のコマンドでインストールしてください:\n"
-            "  sudo apt install ffmpeg"
+            "Windows の場合は以下でインストールしてください:\n"
+            "  winget install Gyan.FFmpeg\n"
+            "インストール後にターミナルを再起動してください。"
         )
 
 
@@ -123,6 +116,4 @@ def _run(cmd: list[str]) -> None:
     """コマンドを実行してエラーを捕捉する。"""
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        raise RuntimeError(
-            f"ffmpeg エラー:\n{result.stderr}"
-        )
+        raise RuntimeError(f"ffmpeg エラー:\n{result.stderr}")

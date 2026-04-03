@@ -7,7 +7,32 @@ requires-python = ">=3.10"
 dependencies = [
     "insightface>=0.7.3",
     "onnxruntime<1.20",
-    "opencv-python>=4.13.0.92",
+    # cv2.imshow 等の GUI 機能は使わないため headless 版で十分。
+    # Windows / Linux 両対応。
+    "opencv-python-headless>=4.13.0.92",
     "pillow>=12.1.1",
     "ultralytics>=8.4.27",
+]
+
+# ultralytics は PyPI の依存宣言で opencv-python（GUI版）を要求している。
+# そのままだと opencv-python-headless と GUI版が両方インストールされ、
+# site-packages に cv2 が重複して import 時にどちらを掴むか不定になる。
+# uv の dependency-metadata で ultralytics の opencv 依存を
+# headless 版に差し替えることで重複インストールを防ぐ。
+# （ultralytics のバージョンを上げた際は requires-dist の内容を要見直し）
+[[tool.uv.dependency-metadata]]
+name = "ultralytics"
+requires-dist = [
+    "numpy>=1.23.0",
+    "matplotlib>=3.3.0",
+    "opencv-python-headless>=4.6.0",
+    "pillow>=7.1.2",
+    "pyyaml>=5.3.1",
+    "requests>=2.23.0",
+    "scipy>=1.4.1",
+    "torch>=1.8.0",
+    "torchvision>=0.9.0",
+    "psutil>=5.8.0",
+    "polars>=0.20.0",
+    "ultralytics-thop>=2.0.18",
 ]

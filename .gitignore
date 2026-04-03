@@ -24,3 +24,6 @@ wheels/
 *.tiff
 *.tif
 *.svg
+
+# Custom files
+intervals.json
