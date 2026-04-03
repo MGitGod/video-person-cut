@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "customtkinter>=5.2.2",
     "insightface>=0.7.3",
     "onnxruntime<1.20",
     # cv2.imshow 等の GUI 機能は使わないため headless 版で十分。

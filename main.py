@@ -41,7 +41,7 @@ def _x11_init_threads_early() -> None:
 
 _x11_init_threads_early()
 
-from cutter import cut_and_merge
+from cutter import cut_and_merge # noqa: E402
 
 
 def _format_elapsed(seconds: float) -> str:

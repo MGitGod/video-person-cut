@@ -21,21 +21,38 @@ editor.py
   - Ctrl+Z / アンドゥボタンで操作を取り消す（最大 50 件）
   - 区間を JSON ファイルに保存・読み込み（再検出スキップ用）
   - 確定後にカット & 結合を実行
+
+UI:
+  - CustomTkinter によるダークテーマ
+  - tk.Canvas（タイムライン・プレビュー）は置き換え不可のため素の Tkinter のまま
 """
 
 import copy
 import json
 import threading
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import filedialog, messagebox
 from pathlib import Path
 from typing import Callable
 
+import customtkinter as ctk
 import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
 from cutter import cut_and_merge
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CustomTkinter グローバル設定
+# ──────────────────────────────────────────────────────────────────────────────
+
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
+
+# CTkFrame のダーク時デフォルト背景色（Canvas の bg に合わせるために使用）
+_CTK_BG  = "#2b2b2b"   # CTkFrame ダーク背景
+_CTK_BG2 = "#1a1a1a"   # より暗い背景（タイムライン Canvas と同系色）
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -72,6 +89,27 @@ def _fmt(sec: float) -> str:
     m = int(sec) // 60
     s = sec % 60
     return f"{m:02d}:{s:04.1f}"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ラベル付きフレーム（ttk.LabelFrame の CTk 代替）
+# ──────────────────────────────────────────────────────────────────────────────
+
+class _CTkLabelFrame(ctk.CTkFrame):
+    """
+    ttk.LabelFrame の CustomTkinter 版。
+    CTkFrame の上端に小さいラベルを置くだけのシンプルなラッパー。
+    """
+
+    def __init__(self, parent: tk.Widget, text: str, **kw) -> None:
+        super().__init__(parent, **kw)
+        ctk.CTkLabel(
+            self,
+            text=text,
+            font=ctk.CTkFont(size=11),
+            text_color="#888888",
+            anchor="w",
+        ).pack(fill="x", padx=8, pady=(4, 0))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -119,10 +157,8 @@ class ThumbnailCache:
         まだ生成されていなければ None を返す。
         必ずメインスレッドから呼ぶこと。
         """
-        # すでに PhotoImage に変換済みならそのまま返す
         if sec in self._tk:
             return self._tk[sec]
-        # PIL Image が届いていれば PhotoImage に変換する（メインスレッド限定）
         with self._lock:
             pil = self._pil.get(sec)
         if pil is None:
@@ -143,7 +179,6 @@ class ThumbnailCache:
         for sec in range(total_sec + 1):
             if self._stop:
                 break
-            # 各秒の先頭フレームを取得
             cap.set(cv2.CAP_PROP_POS_FRAMES, int(sec * fps))
             ret, frame = cap.read()
             if not ret:
@@ -207,7 +242,6 @@ class IntervalModel:
     def undo(self) -> bool:
         """
         1つ前の状態に戻す。
-        履歴スタックから最新の状態を取り出して _ivs に戻し、リスナーに通知する。
 
         Returns:
             アンドゥできた場合 True、履歴がなく何もしなかった場合 False
@@ -231,12 +265,16 @@ class IntervalModel:
         self._push_history()
         end = self._ivs[idx][1]
         self._ivs[idx][0] = max(0.0, min(v, end - 0.1))
+        # 左端を前の区間に重ねたとき自動結合
+        self._merge_overlapping()
         self._notify()
 
     def set_end(self, idx: int, v: float) -> None:
         self._push_history()
         start = self._ivs[idx][0]
         self._ivs[idx][1] = min(self.total_sec, max(v, start + 0.1))
+        # 右端を次の区間に重ねたとき自動結合
+        self._merge_overlapping()
         self._notify()
 
     def move(self, idx: int, delta: float) -> None:
@@ -264,6 +302,37 @@ class IntervalModel:
         self._ivs = [list(iv) for iv in intervals]
         self._notify()
 
+    def _merge_overlapping(self) -> None:
+        """
+        重なっている（または接触している）区間を1つに結合する。
+        set_start / set_end のハンドルドラッグ後に自動的に呼ばれる。
+
+        アルゴリズム:
+          1. 開始時刻でソート
+          2. 先頭から順に見ていき、次の区間の開始が現在の区間の終了以下なら結合
+             （start_next <= end_current → 完全に重なっている）
+
+        アンドゥとの関係:
+          このメソッドは _push_history() の後に呼ばれるため、
+          結合前の状態がスタックに積まれている。
+          Ctrl+Z で結合前の「2区間に分かれていた状態」に1ステップで戻れる。
+        """
+        if len(self._ivs) < 2:
+            return
+
+        self._ivs.sort()
+        merged: list[list[float]] = [self._ivs[0][:]]
+
+        for iv in self._ivs[1:]:
+            prev = merged[-1]
+            if iv[0] <= prev[1]:
+                # 重なっている → 終了時刻を大きい方に伸ばして結合
+                prev[1] = max(prev[1], iv[1])
+            else:
+                merged.append(iv[:])
+
+        self._ivs = merged
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # フィルムストリップタイムライン
@@ -272,6 +341,7 @@ class IntervalModel:
 class FilmstripTimeline(tk.Canvas):
     """
     Premiere 風フィルムストリップタイムライン。
+    tk.Canvas を直接継承するため CTk 化は不可。見た目は素の Tkinter のまま。
 
     Canvas の y 座標レイアウト:
       [0, THUMB_H)               → サムネイル帯（1 枚 = 1 秒 = THUMB_W px）
@@ -308,7 +378,8 @@ class FilmstripTimeline(tk.Canvas):
             parent,
             height=TL_H,
             scrollregion=(0, 0, canvas_w, TL_H),
-            bg="#1A1A1A",
+            bg=_CTK_BG2,
+            highlightthickness=0,
             **kw,
         )
         self._model     = model
@@ -318,7 +389,6 @@ class FilmstripTimeline(tk.Canvas):
         self._head_sec  = 0.0
         self._drag: dict | None = None
 
-        # 全秒のプレースホルダーを描いてからオーバーレイを重ねる
         self._draw_placeholders()
         self._redraw_overlay()
 
@@ -330,7 +400,6 @@ class FilmstripTimeline(tk.Canvas):
         # マウス移動時にカーソル形状を更新する
         self.bind("<Motion>",          self._on_motion)
 
-        # モデルが変わるたびにオーバーレイを描き直す
         model.add_listener(self._redraw_overlay)
 
     # ── 座標変換 ──────────────────────────────────────────────────────────────
@@ -390,14 +459,13 @@ class FilmstripTimeline(tk.Canvas):
         bar_y0  = THUMB_H
         bar_y1  = THUMB_H + BAR_H
 
-        # ── 区間バーの背景（全体をダークグレーで塗る）────────────────────────
+        # 区間バーの背景（全体をダークグレーで塗る）
         self.create_rectangle(
             0, bar_y0, total_w, bar_y1,
-            fill="#2A2A2A", outline="",
+            fill="#222222", outline="",
             tags="overlay",
         )
 
-        # ── 検出区間バー + 両端ハンドル ──────────────────────────────────────
         for s, e in self._model.get():
             x1 = self._sec2x(s)
             x2 = self._sec2x(e)
@@ -424,13 +492,12 @@ class FilmstripTimeline(tk.Canvas):
                 tags="handle",
             )
 
-        # ── 時刻目盛り ────────────────────────────────────────────────────────
+        # 時刻目盛り
         ruler_y = bar_y1
-        # 目盛りは最大 20 本になるよう間隔を調整
         step = max(1, int(self._total_sec / 20))
         for t in range(0, int(self._total_sec) + 1, step):
             x = self._sec2x(t)
-            self.create_line(x, ruler_y, x, TL_H, fill="#555", tags="ruler")
+            self.create_line(x, ruler_y, x, TL_H, fill="#444", tags="ruler")
             self.create_text(
                 x + 2, ruler_y + 2,
                 text=_fmt(t), anchor="nw",
@@ -438,7 +505,6 @@ class FilmstripTimeline(tk.Canvas):
                 tags="ruler",
             )
 
-        # ── シークヘッド（最前面）────────────────────────────────────────────
         self._draw_head()
 
     def _draw_head(self) -> None:
@@ -486,7 +552,6 @@ class FilmstripTimeline(tk.Canvas):
                 self.config(cursor="sb_h_double_arrow")
                 return
 
-        # ハンドル以外では標準カーソルに戻す
         self.config(cursor="")
 
     # ── マウスイベント ────────────────────────────────────────────────────────
@@ -495,13 +560,11 @@ class FilmstripTimeline(tk.Canvas):
         cx = self.canvasx(ev.x)
         cy = self.canvasy(ev.y)
 
-        # ── サムネイル帯 or 目盛りゾーン → 常にシーク ────────────────────────
-        # 区間の x 範囲内であっても、バーゾーン以外では区間操作しない
+        # サムネイル帯 or 目盛りゾーン → 常にシーク
         if not (THUMB_H <= cy < THUMB_H + BAR_H):
             self._on_seek(self._x2sec(cx))
             return
 
-        # ── 区間バーゾーン ────────────────────────────────────────────────────
         hit = self._hit(cx)
         if hit:
             idx, part = hit
@@ -527,17 +590,11 @@ class FilmstripTimeline(tk.Canvas):
         ivs = self._model.get()
 
         if part == "left":
-            new_val = ivs[idx][0] + delta
-            # シークヘッドへのスナップ判定
-            new_val = self._snap_to_head(new_val)
+            new_val = self._snap_to_head(ivs[idx][0] + delta)
             self._model.set_start(idx, new_val)
-
         elif part == "right":
-            new_val = ivs[idx][1] + delta
-            # シークヘッドへのスナップ判定
-            new_val = self._snap_to_head(new_val)
+            new_val = self._snap_to_head(ivs[idx][1] + delta)
             self._model.set_end(idx, new_val)
-
         else:
             # body ドラッグは区間全体を移動（スナップなし）
             self._model.move(idx, delta)
@@ -548,12 +605,6 @@ class FilmstripTimeline(tk.Canvas):
         """
         指定した秒数がシークヘッドから SNAP_PX ピクセル以内なら
         シークヘッドの秒数を返す。そうでなければ sec をそのまま返す。
-
-        Args:
-            sec: スナップ前の秒数
-
-        Returns:
-            スナップ後の秒数
         """
         head_x = self._sec2x(self._head_sec)
         new_x  = self._sec2x(sec)
@@ -618,7 +669,7 @@ class FilmstripTimeline(tk.Canvas):
 # 区間リストウィジェット
 # ──────────────────────────────────────────────────────────────────────────────
 
-class IntervalListWidget(ttk.Frame):
+class IntervalListWidget(ctk.CTkFrame):
     """
     区間の一覧表示 + 数値入力による微調整ウィジェット。
     モデルが変更されるたびに自動再描画される。
@@ -631,20 +682,34 @@ class IntervalListWidget(ttk.Frame):
         on_seek: Callable[[float], None],
         **kw,
     ) -> None:
-        super().__init__(parent, **kw)
+        super().__init__(parent, fg_color="transparent", **kw)
         self._model   = model
         self._on_seek = on_seek
 
-        # ヘッダー
-        hdr = ttk.Frame(self)
+        # ── ヘッダー行 ────────────────────────────────────────────────────────
+        hdr = ctk.CTkFrame(self, fg_color="transparent")
         hdr.pack(fill="x", pady=(0, 2))
-        for text, w in [("#", 3), ("開始 (秒)", 10), ("終了 (秒)", 10), ("長さ (秒)", 10)]:
-            ttk.Label(hdr, text=text, width=w).pack(side="left")
+        for text, w in [("#", 30), ("開始 (秒)", 80), ("終了 (秒)", 80), ("長さ (秒)", 72)]:
+            ctk.CTkLabel(
+                hdr, text=text, width=w,
+                font=ctk.CTkFont(size=11, weight="bold"),
+                text_color="#777777",
+                anchor="w",
+            ).pack(side="left", padx=2)
 
-        # スクロール可能なリスト領域
-        self._cv    = tk.Canvas(self, height=180, highlightthickness=0)
-        sb          = ttk.Scrollbar(self, orient="vertical", command=self._cv.yview)
-        self._inner = ttk.Frame(self._cv)
+        # ── スクロール可能なリスト領域 ────────────────────────────────────────
+        # CTkScrollbar + tk.Canvas の組み合わせで実現する
+        list_outer = ctk.CTkFrame(self, fg_color="transparent")
+        list_outer.pack(fill="both", expand=True)
+
+        self._cv = tk.Canvas(
+            list_outer, height=200,
+            bg=_CTK_BG, highlightthickness=0,
+        )
+        sb = ctk.CTkScrollbar(
+            list_outer, orientation="vertical", command=self._cv.yview
+        )
+        self._inner = ctk.CTkFrame(self._cv, fg_color="transparent")
         self._cv.create_window((0, 0), window=self._inner, anchor="nw")
         self._cv.configure(yscrollcommand=sb.set)
         self._inner.bind(
@@ -654,12 +719,12 @@ class IntervalListWidget(ttk.Frame):
         self._cv.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
 
-        # 追加ボタン
-        bf = ttk.Frame(self)
-        bf.pack(fill="x", pady=4)
-        ttk.Button(bf, text="＋ 区間追加", command=self._add).pack(
-            side="left", padx=2
-        )
+        # ── 追加ボタン ────────────────────────────────────────────────────────
+        ctk.CTkButton(
+            self, text="＋ 区間追加",
+            height=30, corner_radius=6,
+            command=self._add,
+        ).pack(fill="x", padx=4, pady=(6, 2))
 
         model.add_listener(self._rebuild)
         self._rebuild()
@@ -670,37 +735,49 @@ class IntervalListWidget(ttk.Frame):
             w.destroy()
 
         for i, (s, e) in enumerate(self._model.get()):
-            row = ttk.Frame(self._inner)
-            row.pack(fill="x", pady=1)
+            row = ctk.CTkFrame(self._inner, fg_color="#333333", corner_radius=6)
+            row.pack(fill="x", padx=4, pady=2)
 
-            ttk.Label(row, text=str(i + 1), width=3).pack(side="left")
+            # 区間番号
+            ctk.CTkLabel(
+                row, text=str(i + 1), width=28,
+                font=ctk.CTkFont(size=11, weight="bold"),
+                text_color="#999999",
+            ).pack(side="left", padx=(8, 2))
 
-            # 開始時刻
+            # 開始時刻入力
             sv = tk.StringVar(value=f"{s:.2f}")
-            se = ttk.Entry(row, textvariable=sv, width=10)
+            se = ctk.CTkEntry(row, textvariable=sv, width=78, height=28)
             se.pack(side="left", padx=4)
             se.bind("<Return>",   lambda _, idx=i, v=sv: self._apply_s(idx, v))
             se.bind("<FocusOut>", lambda _, idx=i, v=sv: self._apply_s(idx, v))
 
-            # 終了時刻
+            # 終了時刻入力
             ev = tk.StringVar(value=f"{e:.2f}")
-            ee = ttk.Entry(row, textvariable=ev, width=10)
+            ee = ctk.CTkEntry(row, textvariable=ev, width=78, height=28)
             ee.pack(side="left", padx=4)
             ee.bind("<Return>",   lambda _, idx=i, v=ev: self._apply_e(idx, v))
             ee.bind("<FocusOut>", lambda _, idx=i, v=ev: self._apply_e(idx, v))
 
             # 長さ（読み取り専用）
-            ttk.Label(row, text=f"{e - s:.2f}", width=10).pack(side="left")
-
-            # 頭出し・削除ボタン
-            ttk.Button(
-                row, text="▶", width=2,
-                command=lambda sec=s: self._on_seek(sec),
-            ).pack(side="left")
-            ttk.Button(
-                row, text="✕", width=2,
-                command=lambda idx=i: self._remove(idx),
+            ctk.CTkLabel(
+                row, text=f"{e - s:.2f}", width=70,
+                text_color="#cccccc", font=ctk.CTkFont(size=11),
             ).pack(side="left", padx=2)
+
+            # 頭出しボタン
+            ctk.CTkButton(
+                row, text="▶", width=34, height=28, corner_radius=4,
+                fg_color="#1a5f8a", hover_color="#1EA0FF",
+                command=lambda sec=s: self._on_seek(sec),
+            ).pack(side="left", padx=2)
+
+            # 削除ボタン
+            ctk.CTkButton(
+                row, text="✕", width=34, height=28, corner_radius=4,
+                fg_color="#6b2020", hover_color="#c0392b",
+                command=lambda idx=i: self._remove(idx),
+            ).pack(side="left", padx=(2, 8))
 
     def _apply_s(self, idx: int, v: tk.StringVar) -> None:
         try:
@@ -734,7 +811,7 @@ class EditorApp:
 
     def __init__(
         self,
-        root: tk.Tk,
+        root: ctk.CTk,
         video_path: str,
         intervals: list[tuple[float, float]],
         output_path: str,
@@ -778,10 +855,7 @@ class EditorApp:
         root.after(100, self._thumb_cache.start)
 
     def _on_thumb_ready(self, sec: int) -> None:
-        """
-        バックグラウンドスレッドからサムネイル生成完了の通知を受け、
-        タイムライン上の対応コマを更新する。
-        """
+        """バックグラウンドスレッドからサムネイル生成完了の通知を受けタイムラインを更新する。"""
         self._tl.update_thumbnail(sec)
 
     # ── UI 構築 ───────────────────────────────────────────────────────────────
@@ -790,88 +864,129 @@ class EditorApp:
         root = self.root
 
         # ── 上部バー（ファイル情報・JSON 操作・アンドゥ）────────────────────
-        top = ttk.Frame(root)
-        top.pack(fill="x", padx=8, pady=4)
-        ttk.Label(
+        top = ctk.CTkFrame(root, fg_color="transparent")
+        top.pack(fill="x", padx=10, pady=(8, 4))
+
+        ctk.CTkLabel(
             top,
-            text=f"動画: {Path(self.video_path).name}　全長: {_fmt(self._total_sec)}",
+            text=f"🎬  {Path(self.video_path).name}    全長: {_fmt(self._total_sec)}",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            anchor="w",
         ).pack(side="left")
-        ttk.Button(top, text="JSON 読込",
-                   command=self._load_json).pack(side="right", padx=4)
-        ttk.Button(top, text="JSON 保存",
-                   command=self._save_json).pack(side="right", padx=4)
-        # アンドゥボタン（Ctrl+Z のヒントを括弧内に表示）
-        ttk.Button(top, text="↩ アンドゥ (Ctrl+Z)",
-                   command=self._undo).pack(side="right", padx=4)
+
+        # 右側ボタン群（右から順に pack）
+        ctk.CTkButton(
+            top, text="JSON 読込", width=100, height=30, corner_radius=6,
+            command=self._load_json,
+        ).pack(side="right", padx=4)
+        ctk.CTkButton(
+            top, text="JSON 保存", width=100, height=30, corner_radius=6,
+            fg_color="#2d6a4f", hover_color="#40916c",
+            command=self._save_json,
+        ).pack(side="right", padx=4)
+        ctk.CTkButton(
+            top, text="↩  アンドゥ  (Ctrl+Z)", width=170, height=30, corner_radius=6,
+            fg_color="#4a4a4a", hover_color="#666666",
+            command=self._undo,
+        ).pack(side="right", padx=4)
 
         # ── 中央（プレビュー + 区間リスト）──────────────────────────────────
-        center = ttk.Frame(root)
-        center.pack(fill="both", expand=True, padx=8)
+        center = ctk.CTkFrame(root, fg_color="transparent")
+        center.pack(fill="both", expand=True, padx=10, pady=4)
 
-        # プレビューキャンバス
-        self._preview = tk.Canvas(center, width=PREVIEW_W, height=PREVIEW_H, bg="black")
-        self._preview.pack(side="left", padx=(0, 8))
+        # プレビューキャンバス（tk.Canvas は置き換え不可なので薄いフレームで包む）
+        preview_wrap = ctk.CTkFrame(center, fg_color="#111111", corner_radius=8)
+        preview_wrap.pack(side="left", padx=(0, 8))
+        self._preview = tk.Canvas(
+            preview_wrap,
+            width=PREVIEW_W, height=PREVIEW_H,
+            bg="#111111", highlightthickness=0,
+        )
+        self._preview.pack(padx=4, pady=4)
 
         # 区間リスト
-        lf = ttk.LabelFrame(center, text="区間リスト")
-        lf.pack(side="left", fill="both", expand=True)
-        IntervalListWidget(lf, self._model, self._seek).pack(
-            fill="both", expand=True, padx=4, pady=4
+        iv_frame = _CTkLabelFrame(center, text="区間リスト", corner_radius=8)
+        iv_frame.pack(side="left", fill="both", expand=True)
+        IntervalListWidget(iv_frame, self._model, self._seek).pack(
+            fill="both", expand=True, padx=6, pady=(0, 6)
         )
 
         # ── フィルムストリップタイムライン ───────────────────────────────────
-        tlf = ttk.LabelFrame(
+        tl_frame = _CTkLabelFrame(
             root,
-            text="タイムライン  "
-                 "（クリック: シーク　ドラッグ: 移動/リサイズ　"
+            text="タイムライン  （クリック: シーク　ドラッグ: 移動/リサイズ　"
                  "ダブルクリック: 区間追加　右クリック: 区間削除）",
+            corner_radius=8,
         )
-        tlf.pack(fill="x", padx=8, pady=4)
+        tl_frame.pack(fill="x", padx=10, pady=4)
 
         self._tl = FilmstripTimeline(
-            tlf,
+            tl_frame,
             model=self._model,
             cache=self._thumb_cache,
             total_sec=self._total_sec,
             on_seek=self._seek,
         )
-        self._tl.pack(fill="x", padx=4, pady=(4, 0))
+        self._tl.pack(fill="x", padx=6, pady=(2, 0))
 
-        # 横スクロールバー
-        tl_sb = ttk.Scrollbar(tlf, orient="horizontal", command=self._tl.xview)
-        tl_sb.pack(fill="x", padx=4, pady=(0, 4))
+        # 横スクロールバー（CTkScrollbar）
+        tl_sb = ctk.CTkScrollbar(
+            tl_frame, orientation="horizontal", command=self._tl.xview
+        )
+        tl_sb.pack(fill="x", padx=6, pady=(0, 6))
         self._tl.configure(xscrollcommand=tl_sb.set)
 
         # ── 再生コントロール ──────────────────────────────────────────────────
-        ctrl = ttk.Frame(root)
-        ctrl.pack(fill="x", padx=8, pady=2)
-        ttk.Button(ctrl, text="⏮ 先頭",
-                   command=lambda: self._seek(0.0)).pack(side="left", padx=2)
-        ttk.Button(ctrl, text="◀ -5秒",
-                   command=lambda: self._seek(self._cur_sec - 5)).pack(
-            side="left", padx=2
+        ctrl = ctk.CTkFrame(root, fg_color="transparent")
+        ctrl.pack(fill="x", padx=10, pady=2)
+
+        btn_kw = dict(height=32, corner_radius=6, fg_color="#3a3a3a", hover_color="#555555")
+
+        ctk.CTkButton(ctrl, text="⏮  先頭",  width=80, **btn_kw,
+                      command=lambda: self._seek(0.0)).pack(side="left", padx=2)
+        ctk.CTkButton(ctrl, text="◀  -5秒", width=80, **btn_kw,
+                      command=lambda: self._seek(self._cur_sec - 5)).pack(side="left", padx=2)
+
+        self._play_btn = ctk.CTkButton(
+            ctrl, text="▶  再生", width=100, height=32, corner_radius=6,
+            command=self._toggle_play,
         )
-        self._play_btn = ttk.Button(ctrl, text="▶ 再生",
-                                    command=self._toggle_play)
         self._play_btn.pack(side="left", padx=2)
-        ttk.Button(ctrl, text="▶ +5秒",
-                   command=lambda: self._seek(self._cur_sec + 5)).pack(
-            side="left", padx=2
+
+        ctk.CTkButton(ctrl, text="+5秒  ▶", width=80, **btn_kw,
+                      command=lambda: self._seek(self._cur_sec + 5)).pack(side="left", padx=2)
+
+        self._pos_lbl = ctk.CTkLabel(
+            ctrl,
+            text=f"00:00.0 / {_fmt(self._total_sec)}",
+            font=ctk.CTkFont(size=13),
+            width=200, anchor="w",
         )
-        self._pos_lbl = ttk.Label(ctrl, text=f"00:00.0 / {_fmt(self._total_sec)}")
         self._pos_lbl.pack(side="left", padx=12)
 
-        # ← → キーについてのヒントラベル
-        ttk.Label(ctrl, text="← → : 1フレーム移動", foreground="#888").pack(
-            side="right", padx=8
-        )
+        ctk.CTkLabel(
+            ctrl, text="← → : 1フレーム移動",
+            font=ctk.CTkFont(size=11), text_color="#555555",
+        ).pack(side="right", padx=8)
 
         # ── 出力バー ─────────────────────────────────────────────────────────
-        out = ttk.Frame(root)
-        out.pack(fill="x", padx=8, pady=(0, 8))
-        ttk.Label(out, text=f"出力先: {self.output_path}").pack(side="left")
-        ttk.Button(out, text="✂ カット & 出力",
-                   command=self._export).pack(side="right", padx=4)
+        out = ctk.CTkFrame(root, fg_color="transparent")
+        out.pack(fill="x", padx=10, pady=(2, 10))
+
+        ctk.CTkLabel(
+            out,
+            text=f"出力先: {self.output_path}",
+            font=ctk.CTkFont(size=11), text_color="#666666",
+            anchor="w",
+        ).pack(side="left")
+
+        ctk.CTkButton(
+            out, text="✂  カット & 出力",
+            width=160, height=36, corner_radius=8,
+            fg_color="#1a5f8a", hover_color="#1EA0FF",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self._export,
+        ).pack(side="right", padx=4)
 
         # ── キーバインド ──────────────────────────────────────────────────────
         # 左右矢印キー: 1 フレーム単位のシーク
@@ -885,10 +1000,10 @@ class EditorApp:
     def _is_entry_focused(self) -> bool:
         """
         現在フォーカスが Entry ウィジェットにあるか判定する。
-        True の場合は矢印キーをシークに使わず、テキスト編集を優先する。
+        CTkEntry は内部的に tk.Entry を持つため isinstance(w, tk.Entry) で捕捉できる。
         """
         w = self.root.focus_get()
-        return isinstance(w, (tk.Entry, ttk.Entry))
+        return isinstance(w, tk.Entry)
 
     def _key_seek_left(self, _: tk.Event) -> None:
         """左矢印キー: 1 フレーム分だけ前にシークする。"""
@@ -906,12 +1021,8 @@ class EditorApp:
     # ── アンドゥ ──────────────────────────────────────────────────────────────
 
     def _undo(self) -> None:
-        """
-        1つ前の区間状態に戻す。
-        履歴がない（これ以上戻れない）場合はビープ音で通知する。
-        """
+        """1つ前の区間状態に戻す。履歴がない場合はビープ音で通知する。"""
         if not self._model.undo():
-            # これ以上戻れない場合にビープ音を鳴らす（Windows: bell）
             self.root.bell()
 
     # ── 再生制御 ──────────────────────────────────────────────────────────────
@@ -924,7 +1035,7 @@ class EditorApp:
         if ret:
             self._show(frame)
         self._tl.update_head(self._cur_sec)
-        self._pos_lbl.config(
+        self._pos_lbl.configure(
             text=f"{_fmt(self._cur_sec)} / {_fmt(self._total_sec)}"
         )
 
@@ -946,13 +1057,13 @@ class EditorApp:
     def _toggle_play(self) -> None:
         if self._playing:
             self._playing = False
-            self._play_btn.config(text="▶ 再生")
+            self._play_btn.configure(text="▶  再生")
             if self._after_id:
                 self.root.after_cancel(self._after_id)
                 self._after_id = None
         else:
             self._playing = True
-            self._play_btn.config(text="⏸ 一時停止")
+            self._play_btn.configure(text="⏸  一時停止")
             self._play_loop()
 
     def _play_loop(self) -> None:
@@ -962,12 +1073,12 @@ class EditorApp:
         ret, frame = self._cap.read()
         if not ret:
             self._playing = False
-            self._play_btn.config(text="▶ 再生")
+            self._play_btn.configure(text="▶  再生")
             return
         self._cur_sec = self._cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
         self._show(frame)
         self._tl.update_head(self._cur_sec)
-        self._pos_lbl.config(
+        self._pos_lbl.configure(
             text=f"{_fmt(self._cur_sec)} / {_fmt(self._total_sec)}"
         )
         self._after_id = self.root.after(int(1000 / PLAY_FPS), self._play_loop)
@@ -1021,13 +1132,17 @@ class EditorApp:
         if not path:
             return
 
-        prog = tk.Toplevel(self.root)
+        # 出力中ダイアログ（CTkToplevel 版）
+        prog = ctk.CTkToplevel(self.root)
         prog.title("出力中...")
-        prog.geometry("360x80")
+        prog.geometry("380x100")
         prog.resizable(False, False)
         prog.grab_set()
-        ttk.Label(prog,
-                  text="カット＆結合を実行中です。しばらくお待ちください...").pack(pady=24)
+        ctk.CTkLabel(
+            prog,
+            text="カット＆結合を実行中です。\nしばらくお待ちください...",
+            font=ctk.CTkFont(size=13),
+        ).pack(expand=True)
         prog.update()
 
         try:
@@ -1074,7 +1189,7 @@ def launch_editor(
         crf:         エンコード品質
         preset:      エンコード速度プリセット
     """
-    root = tk.Tk()
+    root = ctk.CTk()
     app  = EditorApp(root, video_path, intervals, output_path, crf, preset)
     root.protocol("WM_DELETE_WINDOW", app.on_close)
     root.mainloop()
