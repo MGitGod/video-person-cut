@@ -74,7 +74,8 @@ def detect_keywords(
     # キーワードを initial_prompt に含めることで固有名詞の認識精度を上げる。
     # Whisper はこのテキストを「直前の発話」として参照するため、
     # キーワードの正しい表記をモデルに事前に教える効果がある。
-    initial_prompt = "なぎちゃん、".join(keywords) + "乃木坂46。" if keywords else None
+    # 渡されたキーワードを読点で並べるだけにする（固定文字列は混入させない）。
+    initial_prompt = "、".join(keywords) + "。" if keywords else None
 
     print(f"【文字起こし】音声を解析中: {video_path}")
     if initial_prompt:

@@ -374,6 +374,8 @@ class FilmstripTimeline(tk.Canvas):
       ハンドルにカーソルを置く→ ←→ カーソルに変わる
       空き領域ダブルクリック  → 2 秒の新規区間を追加
       右クリック（区間上）    → 削除確認
+      サムネイル帯の左端半分  → 1 ページ左スクロール（シークなし）
+      サムネイル帯の右端半分  → 1 ページ右スクロール（シークなし）
     """
 
     def __init__(
@@ -483,7 +485,7 @@ class FilmstripTimeline(tk.Canvas):
             tags="overlay",
         )
 
-        for s, e in self._model.get():
+        for i, (s, e) in enumerate(self._model.get()):
             x1 = self._sec2x(s)
             x2 = self._sec2x(e)
 
@@ -507,6 +509,18 @@ class FilmstripTimeline(tk.Canvas):
                 x2 + EDGE_PX // 2, bar_y1,
                 fill=OVERLAY_DIM, outline="",
                 tags="handle",
+            )
+
+            # 区間番号テキスト（左ハンドルの右隣・バー中央に表示）
+            # バーの幅が狭い場合でも常に左端から描くため anchor="w" を使用
+            self.create_text(
+                x1 + EDGE_PX // 2 + 3,
+                bar_y0 + BAR_H // 2,
+                text=str(i + 1),
+                anchor="w",
+                fill="#ffffff",
+                font=("Helvetica", 9, "bold"),
+                tags="overlay",
             )
 
         # 時刻目盛り
@@ -601,7 +615,16 @@ class FilmstripTimeline(tk.Canvas):
         cx = self.canvasx(ev.x)
         cy = self.canvasy(ev.y)
 
-        # サムネイル帯 or 目盛りゾーン → 常にシーク
+        # ── サムネイル帯クリック ───────────────────────────────────────────────
+        # 端側半分（左端サムネイルの左半分 / 右端サムネイルの右半分）なら
+        # 1 ページスクロールしてシークはしない。それ以外はシーク。
+        if cy < THUMB_H:
+            if self._try_page_scroll(cx):
+                return
+            self._on_seek(self._x2sec(cx))
+            return
+
+        # 目盛りゾーン → 常にシーク
         if not (THUMB_H <= cy < THUMB_H + BAR_H):
             self._on_seek(self._x2sec(cx))
             return
@@ -615,6 +638,52 @@ class FilmstripTimeline(tk.Canvas):
                 self._on_seek(self._x2sec(cx))
         else:
             self._on_seek(self._x2sec(cx))
+
+    def _try_page_scroll(self, canvas_x: float) -> bool:
+        """
+        クリック位置がビューポートの端サムネイルの端側半分にあれば
+        1 ページ分横スクロールして True を返す。それ以外は False を返す。
+
+        「端側半分」の定義:
+          - 左端: ビューポート左端 px ～ (ビューポート左端 px + THUMB_W / 2)
+          - 右端: (ビューポート右端 px - THUMB_W / 2) ～ ビューポート右端 px
+
+        1 ページ = 現在のビューポート幅と同じ距離だけスクロールする。
+        先頭・末尾を超えないようにクリップする。
+
+        Args:
+            canvas_x: クリックした Canvas 絶対 x 座標（スクロール済み）
+
+        Returns:
+            スクロールした場合 True、しなかった場合 False
+        """
+        canvas_w = int(self._total_sec * THUMB_W)
+        if canvas_w <= 0:
+            return False
+
+        left_frac, right_frac = self.xview()
+        vp_left_px  = left_frac  * canvas_w   # ビューポート左端（px）
+        vp_right_px = right_frac * canvas_w   # ビューポート右端（px）
+        vp_w_frac   = right_frac - left_frac  # ビューポート幅（割合）
+
+        # 端フレームを 1 枚残すため、スクロール量を THUMB_W 分だけ縮める。
+        # ビューポートが THUMB_W より小さいときはフォールバックとして幅全体にする。
+        thumb_frac  = THUMB_W / canvas_w
+        scroll_frac = max(thumb_frac, vp_w_frac - thumb_frac)
+
+        # 左端サムネイルの左半分 → 1 ページ左へ（右端に現在の先頭フレームを残す）
+        if canvas_x < vp_left_px + THUMB_W / 2:
+            new_left = max(0.0, left_frac - scroll_frac)
+            self.xview_moveto(new_left)
+            return True
+
+        # 右端サムネイルの右半分 → 1 ページ右へ（左端に現在の末尾フレームを残す）
+        if canvas_x > vp_right_px - THUMB_W / 2:
+            new_left = min(1.0 - vp_w_frac, left_frac + scroll_frac)
+            self.xview_moveto(new_left)
+            return True
+
+        return False
 
     def _drag_move(self, ev: tk.Event) -> None:
         """
@@ -726,6 +795,13 @@ class IntervalListWidget(ctk.CTkFrame):
         super().__init__(parent, fg_color="transparent", **kw)
         self._model   = model
         self._on_seek = on_seek
+        # ハイライト管理
+        # _row_frames: 各区間行の CTkFrame 参照
+        # _play_btns:  各区間行の ▶ ボタン参照
+        # _active_idx: 現在ハイライト中の行インデックス（None = なし）
+        self._row_frames: list[ctk.CTkFrame]   = []
+        self._play_btns:  list[ctk.CTkButton]  = []
+        self._active_idx: int | None           = None
 
         # ── ヘッダー行 ────────────────────────────────────────────────────────
         hdr = ctk.CTkFrame(self, fg_color="transparent")
@@ -775,9 +851,13 @@ class IntervalListWidget(ctk.CTkFrame):
         for w in self._inner.winfo_children():
             w.destroy()
 
+        self._row_frames = []
+        self._play_btns  = []
+
         for i, (s, e) in enumerate(self._model.get()):
             row = ctk.CTkFrame(self._inner, fg_color="#333333", corner_radius=6)
             row.pack(fill="x", padx=4, pady=2)
+            self._row_frames.append(row)
 
             # 区間番号
             ctk.CTkLabel(
@@ -806,12 +886,14 @@ class IntervalListWidget(ctk.CTkFrame):
                 text_color="#cccccc", font=ctk.CTkFont(size=11),
             ).pack(side="left", padx=2)
 
-            # 頭出しボタン
-            ctk.CTkButton(
+            # 頭出しボタン（参照を保持してハイライト制御に使う）
+            play_btn = ctk.CTkButton(
                 row, text="▶", width=34, height=28, corner_radius=4,
                 fg_color="#1a5f8a", hover_color="#1EA0FF",
                 command=lambda sec=s: self._on_seek(sec),
-            ).pack(side="left", padx=2)
+            )
+            play_btn.pack(side="left", padx=2)
+            self._play_btns.append(play_btn)
 
             # 削除ボタン
             ctk.CTkButton(
@@ -819,6 +901,89 @@ class IntervalListWidget(ctk.CTkFrame):
                 fg_color="#6b2020", hover_color="#c0392b",
                 command=lambda idx=i: self._remove(idx),
             ).pack(side="left", padx=(2, 8))
+
+        # リビルド後は前のアクティブ状態を再適用する
+        self._apply_active(self._active_idx)
+
+    def set_active(self, idx: "int | None") -> None:
+        """
+        指定インデックスの行をハイライトし、リストをスクロールして表示する。
+        None を渡すと全行のハイライトを解除する。
+
+        呼び出しタイミング:
+          EditorApp._update_active_interval() から、シーク位置が区間内に
+          入ったとき / 区間外に出たときに呼ばれる。
+
+        Args:
+            idx: ハイライトする区間インデックス（0 始まり）、または None
+        """
+        if idx == self._active_idx:
+            return   # 変化なし → 再描画不要
+
+        self._active_idx = idx
+        self._apply_active(idx)
+
+        # アクティブ行が見えるようにリストをスクロールする
+        if idx is not None and 0 <= idx < len(self._row_frames):
+            self._scroll_to_row(idx)
+
+    def _apply_active(self, idx: "int | None") -> None:
+        """
+        全行の背景色と ▶ ボタン色を idx に基づいてまとめて更新する。
+
+        通常行:     背景 #333333  ▶ボタン #1a5f8a（ダークブルー）
+        アクティブ行: 背景 #1e3a50  ▶ボタン #1EA0FF（スカイブルー）
+
+        Args:
+            idx: アクティブにする行インデックス、または None
+        """
+        for i, (row, btn) in enumerate(zip(self._row_frames, self._play_btns)):
+            if i == idx:
+                row.configure(fg_color="#1e3a50")
+                btn.configure(fg_color="#1EA0FF", hover_color="#5bc8ff")
+            else:
+                row.configure(fg_color="#333333")
+                btn.configure(fg_color="#1a5f8a", hover_color="#1EA0FF")
+
+    def _scroll_to_row(self, idx: int) -> None:
+        """
+        指定インデックスの行が Canvas のビューポートに収まるようにスクロールする。
+
+        仕組み:
+          tk.Canvas + CTkFrame（_inner）の組み合わせで実現しているため、
+          winfo_y() で inner 内の行の y 座標を取得し、
+          canvas の scrollregion 高さに対する割合を yview_moveto で
+          指定してスクロールさせる。
+
+        Args:
+            idx: スクロール対象の行インデックス
+        """
+        if not (0 <= idx < len(self._row_frames)):
+            return
+
+        self._inner.update_idletasks()   # geometry が確定してから座標取得する
+
+        row      = self._row_frames[idx]
+        row_y    = row.winfo_y()               # _inner 内での y 座標（px）
+        row_h    = row.winfo_height()          # 行の高さ（px）
+        inner_h  = self._inner.winfo_height()  # 全行合計の高さ（px）
+        canvas_h = self._cv.winfo_height()     # Canvas 表示高さ（px）
+
+        if inner_h <= 0:
+            return
+
+        # 行の上端・下端が Canvas のビューポート内に収まっているか確認
+        top_frac    = row_y / inner_h
+        bottom_frac = (row_y + row_h) / inner_h
+        view_top, view_bottom = self._cv.yview()
+
+        if top_frac < view_top:
+            # 行が上にはみ出している → 行の上端が見えるようにスクロール
+            self._cv.yview_moveto(top_frac)
+        elif bottom_frac > view_bottom:
+            # 行が下にはみ出している → 行の下端が見えるようにスクロール
+            visible_frac = canvas_h / inner_h
+            self._cv.yview_moveto(max(0.0, bottom_frac - visible_frac))
 
     def _apply_s(self, idx: int, v: tk.StringVar) -> None:
         try:
@@ -876,6 +1041,9 @@ class EditorApp:
             kw: _KW_PALETTE[i % len(_KW_PALETTE)]
             for i, kw in enumerate(kw_list)
         }
+        # キーワードジャンプの現在位置（ボタンを押すたびに次のヒットへ進む）
+        # 値は「最後にジャンプしたヒットのインデックス」。未押下は -1。
+        self._kw_cursor: dict[str, int] = {kw: -1 for kw in kw_list}
 
         # 動画情報を取得
         self._cap = cv2.VideoCapture(video_path)
@@ -957,12 +1125,11 @@ class EditorApp:
         )
         self._preview.pack(padx=4, pady=4)
 
-        # 区間リスト
+        # 区間リスト（ハイライト制御のために参照を保持する）
         iv_frame = _CTkLabelFrame(center, text="区間リスト", corner_radius=8)
         iv_frame.pack(side="left", fill="both", expand=True)
-        IntervalListWidget(iv_frame, self._model, self._seek).pack(
-            fill="both", expand=True, padx=6, pady=(0, 6)
-        )
+        self._iv_list = IntervalListWidget(iv_frame, self._model, self._seek)
+        self._iv_list.pack(fill="both", expand=True, padx=6, pady=(0, 6))
 
         # ── フィルムストリップタイムライン ───────────────────────────────────
         tl_frame = _CTkLabelFrame(
@@ -999,19 +1166,29 @@ class EditorApp:
                 legend, text="▼ キーワード: ",
                 font=ctk.CTkFont(size=11), text_color="#888888",
             ).pack(side="left")
-            # キーワードごとにカラーバッジを横並びで表示
+            # キーワードごとにジャンプボタンを横並びで表示
+            # ボタンを押すたびに次のヒット位置へシークし、最後まで行ったら最初に戻る
+            # ボタンテキストの "(n/total)" 部分を更新するためボタン参照を保持する
+            self._kw_jump_btns: dict[str, ctk.CTkButton] = {}
             for kw, color in self._kw_colors.items():
                 # そのキーワードが実際にヒットしているときだけ表示
-                if any(w == kw for w, _ in self._keyword_hits):
-                    badge = ctk.CTkFrame(legend, fg_color=color, corner_radius=4)
-                    badge.pack(side="left", padx=(0, 6))
-                    count = sum(1 for w, _ in self._keyword_hits if w == kw)
-                    ctk.CTkLabel(
-                        badge,
-                        text=f"  {kw}  ×{count}  ",
-                        font=ctk.CTkFont(size=11),
-                        text_color="#000000",
-                    ).pack(padx=2, pady=1)
+                hits_for_kw = [(w, t) for w, t in self._keyword_hits if w == kw]
+                if not hits_for_kw:
+                    continue
+                count = len(hits_for_kw)
+                btn = ctk.CTkButton(
+                    legend,
+                    text=f"  {kw}  ×{count}  ▶",
+                    font=ctk.CTkFont(size=11),
+                    text_color="#000000",
+                    fg_color=color,
+                    hover_color=color,  # 色は変えず、カーソルで区別する
+                    corner_radius=4,
+                    height=26,
+                    command=lambda k=kw: self._jump_to_next_kw(k),
+                )
+                btn.pack(side="left", padx=(0, 6))
+                self._kw_jump_btns[kw] = btn
 
         # ── 再生コントロール ──────────────────────────────────────────────────
         ctrl = ctk.CTkFrame(root, fg_color="transparent")
@@ -1102,6 +1279,39 @@ class EditorApp:
         if not self._model.undo():
             self.root.bell()
 
+    # ── キーワードジャンプ ────────────────────────────────────────────────────
+
+    def _jump_to_next_kw(self, keyword: str) -> None:
+        """
+        指定キーワードの次のヒット位置にシーク（タイムラインも自動スクロール）する。
+        最後のヒットまで行ったら最初に戻るループ動作。
+        ボタンのテキストを "(現在/合計)" 形式に更新する。
+
+        Args:
+            keyword: ジャンプ対象のキーワード文字列
+        """
+        # そのキーワードのヒット一覧を時刻順に取得（detect_keywords がソート済みだが念のため）
+        hits = sorted(
+            [(w, t) for w, t in self._keyword_hits if w == keyword],
+            key=lambda x: x[1],
+        )
+        if not hits:
+            return
+
+        total = len(hits)
+        # 現在のカーソルを 1 進め、末尾を超えたら 0 に折り返す
+        cur = (self._kw_cursor.get(keyword, -1) + 1) % total
+        self._kw_cursor[keyword] = cur
+
+        # シーク（_seek → update_head → _scroll_to_head でタイムラインも追従）
+        _, t = hits[cur]
+        self._seek(t)
+
+        # ボタンテキストを "(現在番号/合計)" に更新
+        btn = getattr(self, "_kw_jump_btns", {}).get(keyword)
+        if btn:
+            btn.configure(text=f"  {keyword}  ({cur + 1}/{total})  ▶")
+
     # ── 再生制御 ──────────────────────────────────────────────────────────────
 
     def _seek(self, sec: float) -> None:
@@ -1115,6 +1325,27 @@ class EditorApp:
         self._pos_lbl.configure(
             text=f"{_fmt(self._cur_sec)} / {_fmt(self._total_sec)}"
         )
+        # シーク位置に応じて区間リストのハイライトを更新する
+        self._update_active_interval()
+
+    def _update_active_interval(self) -> None:
+        """
+        現在のシーク位置（_cur_sec）が検出区間のどこに属するかを調べ、
+        区間リストの対応行をハイライトしてスクロールする。
+
+        処理の流れ:
+          1. モデルから全区間を取得
+          2. _cur_sec が [start, end) に含まれる区間インデックスを探す
+          3. IntervalListWidget.set_active(idx) を呼ぶ
+             （区間外なら None を渡してハイライト解除）
+        """
+        cur = self._cur_sec
+        active: int | None = None
+        for i, (s, e) in enumerate(self._model.get()):
+            if s <= cur < e:
+                active = i
+                break
+        self._iv_list.set_active(active)
 
     def _show(self, frame: np.ndarray) -> None:
         """OpenCV フレームをプレビューキャンバスに描画する。"""
@@ -1158,6 +1389,9 @@ class EditorApp:
         self._pos_lbl.configure(
             text=f"{_fmt(self._cur_sec)} / {_fmt(self._total_sec)}"
         )
+        # 再生中も区間リストのハイライトをリアルタイムで更新する
+        # set_active は変化なしのとき即 return するため 30fps で呼んでも軽量
+        self._update_active_interval()
         self._after_id = self.root.after(int(1000 / PLAY_FPS), self._play_loop)
 
     # ── JSON 保存 / 読み込み ─────────────────────────────────────────────────
@@ -1170,7 +1404,13 @@ class EditorApp:
         )
         if not path:
             return
-        data = {"video_path": self.video_path, "intervals": self._model.get()}
+        data = {
+            "video_path":   self.video_path,
+            "intervals":    self._model.get(),
+            # キーワードヒット情報も保存する
+            # --load-intervals で再読み込みしたとき Whisper を再実行しなくて済む
+            "keyword_hits": self._keyword_hits,
+        }
         Path(path).write_text(
             json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
         )
