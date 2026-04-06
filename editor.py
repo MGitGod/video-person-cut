@@ -79,6 +79,18 @@ OVERLAY_COLOR = "#1EA0FF"   # 検出区間バーの色（スカイブルー）
 OVERLAY_DIM   = "#0D6EBD"   # 区間ハンドルの色（濃いブルー）
 HEAD_COLOR    = "#FF4444"   # シークヘッドの色（赤）
 
+# キーワードマーカーのカラーパレット（キーワードの順番に割り当て、最大8色）
+_KW_PALETTE = [
+    "#FFD700",  # ゴールド
+    "#FF6B6B",  # コーラルレッド
+    "#51CF66",  # グリーン
+    "#FF922B",  # オレンジ
+    "#CC5DE8",  # パープル
+    "#22B8CF",  # シアン
+    "#FF8787",  # ライトピンク
+    "#94D82D",  # ライムグリーン
+]
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ユーティリティ
@@ -371,6 +383,8 @@ class FilmstripTimeline(tk.Canvas):
         cache: ThumbnailCache,
         total_sec: float,
         on_seek: Callable[[float], None],
+        kw_hits: "list[tuple[str, float]]" = None,
+        kw_colors: "dict[str, str]" = None,
         **kw,
     ) -> None:
         canvas_w = max(1, int(total_sec * THUMB_W))
@@ -388,6 +402,9 @@ class FilmstripTimeline(tk.Canvas):
         self._on_seek   = on_seek
         self._head_sec  = 0.0
         self._drag: dict | None = None
+        # キーワードヒット情報（None の場合は空リスト扱い）
+        self._kw_hits   = kw_hits   or []
+        self._kw_colors = kw_colors or {}
 
         self._draw_placeholders()
         self._redraw_overlay()
@@ -503,6 +520,30 @@ class FilmstripTimeline(tk.Canvas):
                 text=_fmt(t), anchor="nw",
                 fill="#888", font=("Helvetica", 7),
                 tags="ruler",
+            )
+
+        # ── キーワードマーカー（縦線 + 下向き三角形）────────────────────────
+        # サムネイル帯の下端から目盛り帯の末端まで縦線を引き、
+        # 目盛り帯の上端に色付き ▼ を描く。
+        # 縦線はサムネイル帯まで伸ばすことで、スクロール中でも目に入りやすくする。
+        for word, t in self._kw_hits:
+            x     = self._sec2x(t)
+            color = self._kw_colors.get(word, "#FFFFFF")
+
+            # サムネイル帯の下 1/3 から目盛り末端まで縦線を引く
+            self.create_line(
+                x, int(THUMB_H * 0.65), x, TL_H,
+                fill=color, width=2, tags="ruler",
+            )
+
+            # 目盛り帯に下向き三角形（より大きく）
+            tip_y = ruler_y + 14   # 三角形の頂点（下端）
+            top_y = ruler_y + 2    # 三角形の底辺（上端）
+            self.create_polygon(
+                x - 7, top_y,
+                x + 7, top_y,
+                x,     tip_y,
+                fill=color, outline="#000000", tags="ruler",
             )
 
         self._draw_head()
@@ -817,12 +858,24 @@ class EditorApp:
         output_path: str,
         crf: int = 18,
         preset: str = "fast",
+        keyword_hits: "list[tuple[str, float]]" = None,
+        keywords: "list[str]" = None,
     ) -> None:
         self.root        = root
         self.video_path  = video_path
         self.output_path = output_path
         self.crf         = crf
         self.preset      = preset
+
+        # キーワード情報（未指定時は空）
+        self._keyword_hits = keyword_hits or []
+        # keywords リストの順序でパレット色を割り当てる
+        # keywords が未指定の場合は hits に出現した順で割り当てる
+        kw_list = keywords or list(dict.fromkeys(w for w, _ in self._keyword_hits))
+        self._kw_colors: dict[str, str] = {
+            kw: _KW_PALETTE[i % len(_KW_PALETTE)]
+            for i, kw in enumerate(kw_list)
+        }
 
         # 動画情報を取得
         self._cap = cv2.VideoCapture(video_path)
@@ -926,6 +979,8 @@ class EditorApp:
             cache=self._thumb_cache,
             total_sec=self._total_sec,
             on_seek=self._seek,
+            kw_hits=self._keyword_hits,
+            kw_colors=self._kw_colors,
         )
         self._tl.pack(fill="x", padx=6, pady=(2, 0))
 
@@ -935,6 +990,28 @@ class EditorApp:
         )
         tl_sb.pack(fill="x", padx=6, pady=(0, 6))
         self._tl.configure(xscrollcommand=tl_sb.set)
+
+        # ── キーワード凡例（キーワードがある場合のみ表示）────────────────────
+        if self._keyword_hits:
+            legend = ctk.CTkFrame(tl_frame, fg_color="transparent")
+            legend.pack(fill="x", padx=8, pady=(0, 6))
+            ctk.CTkLabel(
+                legend, text="▼ キーワード: ",
+                font=ctk.CTkFont(size=11), text_color="#888888",
+            ).pack(side="left")
+            # キーワードごとにカラーバッジを横並びで表示
+            for kw, color in self._kw_colors.items():
+                # そのキーワードが実際にヒットしているときだけ表示
+                if any(w == kw for w, _ in self._keyword_hits):
+                    badge = ctk.CTkFrame(legend, fg_color=color, corner_radius=4)
+                    badge.pack(side="left", padx=(0, 6))
+                    count = sum(1 for w, _ in self._keyword_hits if w == kw)
+                    ctk.CTkLabel(
+                        badge,
+                        text=f"  {kw}  ×{count}  ",
+                        font=ctk.CTkFont(size=11),
+                        text_color="#000000",
+                    ).pack(padx=2, pady=1)
 
         # ── 再生コントロール ──────────────────────────────────────────────────
         ctrl = ctk.CTkFrame(root, fg_color="transparent")
@@ -1178,18 +1255,26 @@ def launch_editor(
     output_path: str,
     crf: int = 18,
     preset: str = "fast",
+    keyword_hits: "list[tuple[str, float]]" = None,
+    keywords: "list[str]" = None,
 ) -> None:
     """
     エディタ GUI を起動する。main.py から呼び出す。
 
     Args:
-        video_path:  入力動画のパス
-        intervals:   検出済み区間リスト
-        output_path: デフォルト出力パス
-        crf:         エンコード品質
-        preset:      エンコード速度プリセット
+        video_path:   入力動画のパス
+        intervals:    検出済み区間リスト
+        output_path:  デフォルト出力パス
+        crf:          エンコード品質
+        preset:       エンコード速度プリセット
+        keyword_hits: [(キーワード, 時刻秒), ...] のリスト
+        keywords:     キーワードリスト（色順序の決定に使用）
     """
     root = ctk.CTk()
-    app  = EditorApp(root, video_path, intervals, output_path, crf, preset)
+    app  = EditorApp(
+        root, video_path, intervals, output_path, crf, preset,
+        keyword_hits=keyword_hits,
+        keywords=keywords,
+    )
     root.protocol("WM_DELETE_WINDOW", app.on_close)
     root.mainloop()

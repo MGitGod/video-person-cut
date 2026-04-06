@@ -10,6 +10,7 @@ dependencies = [
     "onnxruntime<1.20",
     # cv2.imshow 等の GUI 機能は使わないため headless 版で十分。
     # Windows / Linux 両対応。
+    "openai-whisper>=20250625",
     "opencv-python-headless>=4.13.0.92",
     "pillow>=12.1.1",
     "ultralytics>=8.4.27",
