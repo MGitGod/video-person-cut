@@ -91,6 +91,18 @@ _KW_PALETTE = [
     "#94D82D",  # ライムグリーン
 ]
 
+# CLIPマーカーのカラーパレット（キーワードと区別するためクールトーンで統一）
+_CLIP_PALETTE = [
+    "#00BFFF",  # ディープスカイブルー
+    "#7B68EE",  # ミディアムスレートブルー
+    "#00CED1",  # ダークターコイズ
+    "#6495ED",  # コーンフラワーブルー
+    "#40E0D0",  # ターコイズ
+    "#9370DB",  # ミディアムパープル
+    "#20B2AA",  # ライトシーグリーン
+    "#4169E1",  # ロイヤルブルー
+]
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ユーティリティ
@@ -387,6 +399,8 @@ class FilmstripTimeline(tk.Canvas):
         on_seek: Callable[[float], None],
         kw_hits: "list[tuple[str, float]]" = None,
         kw_colors: "dict[str, str]" = None,
+        clip_hits: "list[tuple[str, float]]" = None,
+        clip_colors: "dict[str, str]" = None,
         **kw,
     ) -> None:
         canvas_w = max(1, int(total_sec * THUMB_W))
@@ -407,6 +421,9 @@ class FilmstripTimeline(tk.Canvas):
         # キーワードヒット情報（None の場合は空リスト扱い）
         self._kw_hits   = kw_hits   or []
         self._kw_colors = kw_colors or {}
+        # CLIPヒット情報（None の場合は空リスト扱い）
+        self._clip_hits   = clip_hits   or []
+        self._clip_colors = clip_colors or {}
 
         self._draw_placeholders()
         self._redraw_overlay()
@@ -536,10 +553,9 @@ class FilmstripTimeline(tk.Canvas):
                 tags="ruler",
             )
 
-        # ── キーワードマーカー（縦線 + 下向き三角形）────────────────────────
+        # ── キーワードマーカー（縦線 + 下向き三角形 ▼）────────────────────────
         # サムネイル帯の下端から目盛り帯の末端まで縦線を引き、
         # 目盛り帯の上端に色付き ▼ を描く。
-        # 縦線はサムネイル帯まで伸ばすことで、スクロール中でも目に入りやすくする。
         for word, t in self._kw_hits:
             x     = self._sec2x(t)
             color = self._kw_colors.get(word, "#FFFFFF")
@@ -550,13 +566,36 @@ class FilmstripTimeline(tk.Canvas):
                 fill=color, width=2, tags="ruler",
             )
 
-            # 目盛り帯に下向き三角形（より大きく）
-            tip_y = ruler_y + 14   # 三角形の頂点（下端）
-            top_y = ruler_y + 2    # 三角形の底辺（上端）
+            # 目盛り帯に下向き三角形（▼）
+            tip_y = ruler_y + 14
+            top_y = ruler_y + 2
             self.create_polygon(
                 x - 7, top_y,
                 x + 7, top_y,
                 x,     tip_y,
+                fill=color, outline="#000000", tags="ruler",
+            )
+
+        # ── CLIPマーカー（縦線 + 上向き三角形 ▲）────────────────────────────
+        # キーワードの ▼ と区別するため、サムネイル帯の上端に ▲ を描く。
+        # 縦線はサムネイル帯の上から下方向に引く。
+        for query, t in self._clip_hits:
+            x     = self._sec2x(t)
+            color = self._clip_colors.get(query, "#00BFFF")
+
+            # サムネイル帯の上端から下 1/3 まで縦線を引く
+            self.create_line(
+                x, 0, x, int(THUMB_H * 0.35),
+                fill=color, width=2, tags="ruler",
+            )
+
+            # サムネイル帯の上端に上向き三角形（▲）
+            base_y = 2     # 三角形の底辺（上端）
+            tip_y  = 16    # 三角形の頂点（下端）
+            self.create_polygon(
+                x - 7, tip_y,
+                x + 7, tip_y,
+                x,     base_y,
                 fill=color, outline="#000000", tags="ruler",
             )
 
@@ -1025,6 +1064,8 @@ class EditorApp:
         preset: str = "fast",
         keyword_hits: "list[tuple[str, float]]" = None,
         keywords: "list[str]" = None,
+        clip_hits: "list[tuple[str, float]]" = None,
+        clip_queries: "list[str]" = None,
     ) -> None:
         self.root        = root
         self.video_path  = video_path
@@ -1035,15 +1076,23 @@ class EditorApp:
         # キーワード情報（未指定時は空）
         self._keyword_hits = keyword_hits or []
         # keywords リストの順序でパレット色を割り当てる
-        # keywords が未指定の場合は hits に出現した順で割り当てる
         kw_list = keywords or list(dict.fromkeys(w for w, _ in self._keyword_hits))
         self._kw_colors: dict[str, str] = {
             kw: _KW_PALETTE[i % len(_KW_PALETTE)]
             for i, kw in enumerate(kw_list)
         }
-        # キーワードジャンプの現在位置（ボタンを押すたびに次のヒットへ進む）
-        # 値は「最後にジャンプしたヒットのインデックス」。未押下は -1。
         self._kw_cursor: dict[str, int] = {kw: -1 for kw in kw_list}
+
+        # CLIP情報（未指定時は空）
+        self._clip_hits = clip_hits or []
+        # clip_queries リストの順序でパレット色を割り当てる
+        clip_list = clip_queries or list(dict.fromkeys(q for q, _ in self._clip_hits))
+        self._clip_colors: dict[str, str] = {
+            q: _CLIP_PALETTE[i % len(_CLIP_PALETTE)]
+            for i, q in enumerate(clip_list)
+        }
+        # CLIPジャンプボタン用のカーソル（ボタンを押すたびに次のヒットへ進む）
+        self._clip_cursor: dict[str, int] = {q: -1 for q in clip_list}
 
         # 動画情報を取得
         self._cap = cv2.VideoCapture(video_path)
@@ -1148,6 +1197,8 @@ class EditorApp:
             on_seek=self._seek,
             kw_hits=self._keyword_hits,
             kw_colors=self._kw_colors,
+            clip_hits=self._clip_hits,
+            clip_colors=self._clip_colors,
         )
         self._tl.pack(fill="x", padx=6, pady=(2, 0))
 
@@ -1189,6 +1240,36 @@ class EditorApp:
                 )
                 btn.pack(side="left", padx=(0, 6))
                 self._kw_jump_btns[kw] = btn
+
+        # ── CLIP凡例（CLIPヒットがある場合のみ表示）─────────────────────────
+        if self._clip_hits:
+            clip_legend = ctk.CTkFrame(tl_frame, fg_color="transparent")
+            clip_legend.pack(fill="x", padx=8, pady=(0, 6))
+            ctk.CTkLabel(
+                clip_legend, text="▲ CLIP検索: ",
+                font=ctk.CTkFont(size=11), text_color="#888888",
+            ).pack(side="left")
+            # クエリごとにジャンプボタンを横並びで表示
+            # キーワードボタンと同じループ動作（最後まで行ったら最初に戻る）
+            self._clip_jump_btns: dict[str, ctk.CTkButton] = {}
+            for query, color in self._clip_colors.items():
+                hits_for_q = [(q, t) for q, t in self._clip_hits if q == query]
+                if not hits_for_q:
+                    continue
+                count = len(hits_for_q)
+                btn = ctk.CTkButton(
+                    clip_legend,
+                    text=f"  {query}  ×{count}  ▶",
+                    font=ctk.CTkFont(size=11),
+                    text_color="#000000",
+                    fg_color=color,
+                    hover_color=color,
+                    corner_radius=4,
+                    height=26,
+                    command=lambda q=query: self._jump_to_next_clip(q),
+                )
+                btn.pack(side="left", padx=(0, 6))
+                self._clip_jump_btns[query] = btn
 
         # ── 再生コントロール ──────────────────────────────────────────────────
         ctrl = ctk.CTkFrame(root, fg_color="transparent")
@@ -1286,31 +1367,46 @@ class EditorApp:
         指定キーワードの次のヒット位置にシーク（タイムラインも自動スクロール）する。
         最後のヒットまで行ったら最初に戻るループ動作。
         ボタンのテキストを "(現在/合計)" 形式に更新する。
-
-        Args:
-            keyword: ジャンプ対象のキーワード文字列
         """
-        # そのキーワードのヒット一覧を時刻順に取得（detect_keywords がソート済みだが念のため）
         hits = sorted(
             [(w, t) for w, t in self._keyword_hits if w == keyword],
             key=lambda x: x[1],
         )
         if not hits:
             return
-
         total = len(hits)
-        # 現在のカーソルを 1 進め、末尾を超えたら 0 に折り返す
         cur = (self._kw_cursor.get(keyword, -1) + 1) % total
         self._kw_cursor[keyword] = cur
-
-        # シーク（_seek → update_head → _scroll_to_head でタイムラインも追従）
         _, t = hits[cur]
         self._seek(t)
-
-        # ボタンテキストを "(現在番号/合計)" に更新
         btn = getattr(self, "_kw_jump_btns", {}).get(keyword)
         if btn:
             btn.configure(text=f"  {keyword}  ({cur + 1}/{total})  ▶")
+
+    def _jump_to_next_clip(self, query: str) -> None:
+        """
+        指定CLIPクエリの次のヒット位置にシークする。
+        スコア順（降順）に並べ、ボタンを押すたびに次へ進む。
+        最後まで行ったら最初に戻るループ動作。
+
+        Args:
+            query: ジャンプ対象のCLIPクエリ文字列
+        """
+        # そのクエリのヒット一覧を時刻順に取得
+        hits = sorted(
+            [(q, t) for q, t in self._clip_hits if q == query],
+            key=lambda x: x[1],
+        )
+        if not hits:
+            return
+        total = len(hits)
+        cur = (self._clip_cursor.get(query, -1) + 1) % total
+        self._clip_cursor[query] = cur
+        _, t = hits[cur]
+        self._seek(t)
+        btn = getattr(self, "_clip_jump_btns", {}).get(query)
+        if btn:
+            btn.configure(text=f"  {query}  ({cur + 1}/{total})  ▶")
 
     # ── 再生制御 ──────────────────────────────────────────────────────────────
 
@@ -1407,9 +1503,9 @@ class EditorApp:
         data = {
             "video_path":   self.video_path,
             "intervals":    self._model.get(),
-            # キーワードヒット情報も保存する
-            # --load-intervals で再読み込みしたとき Whisper を再実行しなくて済む
             "keyword_hits": self._keyword_hits,
+            # CLIPヒット情報も保存する（次回 --load-intervals 時に再検索不要になる）
+            "clip_hits":    self._clip_hits,
         }
         Path(path).write_text(
             json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -1497,6 +1593,8 @@ def launch_editor(
     preset: str = "fast",
     keyword_hits: "list[tuple[str, float]]" = None,
     keywords: "list[str]" = None,
+    clip_hits: "list[tuple[str, float]]" = None,
+    clip_queries: "list[str]" = None,
 ) -> None:
     """
     エディタ GUI を起動する。main.py から呼び出す。
@@ -1509,12 +1607,16 @@ def launch_editor(
         preset:       エンコード速度プリセット
         keyword_hits: [(キーワード, 時刻秒), ...] のリスト
         keywords:     キーワードリスト（色順序の決定に使用）
+        clip_hits:    [(クエリ, 時刻秒), ...] のリスト
+        clip_queries: CLIPクエリリスト（色順序の決定に使用）
     """
     root = ctk.CTk()
     app  = EditorApp(
         root, video_path, intervals, output_path, crf, preset,
         keyword_hits=keyword_hits,
         keywords=keywords,
+        clip_hits=clip_hits,
+        clip_queries=clip_queries,
     )
     root.protocol("WM_DELETE_WINDOW", app.on_close)
     root.mainloop()

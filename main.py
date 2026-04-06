@@ -9,6 +9,7 @@ main.py
   python main.py input.mp4 --crf 23 --preset medium
   python main.py input.mp4 --min-gap 2.0
   python main.py input.mp4 --keywords 乃木坂46 サヨナラの意味   # キーワード検出あり
+  python main.py input.mp4 --clip-query "women dancing on stage" # CLIP映像検索あり
 """
 
 import argparse
@@ -105,6 +106,14 @@ def main() -> None:
                         choices=["tiny", "base", "small", "medium", "large"],
                         help="Whisper モデルサイズ（デフォルト: small）")
 
+    # ── CLIP 映像検索オプション ───────────────────────────────────────────────
+    parser.add_argument("--clip-query", nargs="*", default=[], metavar="QUERY",
+                        help="CLIP で検索するクエリ（複数指定可、英語推奨。例: 'women dancing on stage'）")
+    parser.add_argument("--clip-frame-skip", type=int, default=30,
+                        help="CLIP のフレームスキップ（デフォルト: 30 ≒ 1秒に1枚）")
+    parser.add_argument("--clip-top-k", type=int, default=10,
+                        help="クエリごとに上位何件をタイムラインに表示するか（デフォルト: 10）")
+
     args = parser.parse_args()
 
     # 入力ファイルの確認
@@ -135,16 +144,22 @@ def main() -> None:
     if args.keywords:
         print(f"キーワード:       {' / '.join(args.keywords)}")
         print(f"Whisper モデル:   {args.whisper_model}")
+    if args.clip_query:
+        print(f"CLIPクエリ:       {' / '.join(args.clip_query)}")
+        print(f"CLIPスキップ:     {args.clip_frame_skip}フレームおき")
+        print(f"CLIP上位件数:     {args.clip_top_k}件")
     print("=" * 50 + "\n")
 
     total_start    = time.perf_counter()
     step1_elapsed  = 0.0
     step2_elapsed  = 0.0
     step25_elapsed = 0.0   # 文字起こし
+    step_clip_elapsed = 0.0  # CLIP検索
     step3_elapsed  = 0.0
 
     # ── 区間の取得（JSON 読み込み or 検出） ──────────────────────────────────
     keyword_hits: list[tuple[str, float]] = []
+    clip_hits:    list[tuple[str, float]] = []
 
     if args.load_intervals:
         # JSON 読み込みモード（再検出スキップ）
@@ -156,6 +171,7 @@ def main() -> None:
         intervals = [tuple(iv) for iv in data.get("intervals", [])]
         # Linux サブプロセス経由で渡されたキーワードヒットがあれば読み込む
         keyword_hits = [tuple(h) for h in data.get("keyword_hits", [])]
+        clip_hits    = [tuple(h) for h in data.get("clip_hits",    [])]
         print(f"区間ファイルを読み込みました: {json_path}（{len(intervals)}件）\n")
 
         # JSON に keyword_hits が入っていないのに --keywords が指定されていれば
@@ -170,6 +186,24 @@ def main() -> None:
                 model_size=args.whisper_model,
             )
             step25_elapsed = time.perf_counter() - t
+
+        # JSON に clip_hits が入っていないのに --clip-query が指定されていれば
+        # CLIP だけ単独で実行する（人物検出は再実行しない）
+        if args.clip_query and not clip_hits:
+            from clip_search import search_video as clip_search_video
+            print("【CLIP検索】--clip-query が指定されているため CLIP を実行します")
+            t = time.perf_counter()
+            for query in args.clip_query:
+                results = clip_search_video(
+                    video_path=str(input_path),
+                    query=query,
+                    frame_skip=args.clip_frame_skip,
+                    top_k=args.clip_top_k,
+                )
+                # (score, sec, frame) → (query, sec) に変換してタイムライン用に格納
+                for _score, sec, _frame in results:
+                    clip_hits.append((query, sec))
+            step_clip_elapsed = time.perf_counter() - t
 
     else:
         # detector は ONNX / OpenCV が重いため、JSON モード時は import しない
@@ -218,21 +252,48 @@ def main() -> None:
             print(f"【文字起こし】完了: {_format_elapsed(step25_elapsed)}\n")
             return hits
 
-        # ── 2スレッドを同時に走らせ、両方終わるまで待つ ──────────────────────
-        if args.keywords:
-            print("【並列処理開始】人物検出 + 音声文字起こし を同時に実行します\n")
+        # ── Thread 3: CLIP による映像検索 ────────────────────────────────────
+        def _clip_pipeline() -> list[tuple[str, float]]:
+            """CLIP でクエリと意味的に近いフレームを検索する。--clip-query 未指定時は即 return。"""
+            nonlocal step_clip_elapsed
+            if not args.clip_query:
+                return []
+            from clip_search import search_video as clip_search_video
+            hits: list[tuple[str, float]] = []
+            t = time.perf_counter()
+            for query in args.clip_query:
+                print(f"【CLIP検索】クエリ: \"{query}\"")
+                results = clip_search_video(
+                    video_path=str(input_path),
+                    query=query,
+                    frame_skip=args.clip_frame_skip,
+                    top_k=args.clip_top_k,
+                )
+                # (score, sec, frame) → (query, sec) に変換してタイムライン用に格納
+                for _score, sec, _frame in results:
+                    hits.append((query, sec))
+            step_clip_elapsed = time.perf_counter() - t
+            print(f"【CLIP検索】完了: {_format_elapsed(step_clip_elapsed)}\n")
+            return hits
+
+        # ── 3スレッドを同時に走らせ、すべて終わるまで待つ ───────────────────
+        running = [x for x in ["人物検出", args.keywords and "文字起こし", args.clip_query and "CLIP検索"] if x]
+        if len(running) > 1:
+            print(f"【並列処理開始】{' + '.join(running)} を同時に実行します\n")
         parallel_start = time.perf_counter()
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
             future_detect     = pool.submit(_detection_pipeline)
             future_transcribe = pool.submit(_transcription_pipeline)
+            future_clip       = pool.submit(_clip_pipeline)
 
             # result() は例外が起きていればここで再 raise される
             intervals    = future_detect.result()
             keyword_hits = future_transcribe.result()
+            clip_hits    = future_clip.result()
 
         parallel_elapsed = time.perf_counter() - parallel_start
-        if args.keywords:
+        if len(running) > 1:
             print(f"【並列処理完了】合計: {_format_elapsed(parallel_elapsed)}\n")
 
         if not intervals:
@@ -273,6 +334,7 @@ def main() -> None:
                 json.dump({
                     "intervals":    [list(iv) for iv in intervals],
                     "keyword_hits": [list(h)  for h  in keyword_hits],
+                    "clip_hits":    [list(h)  for h  in clip_hits],
                 }, tmp)
                 tmp_path = tmp.name
             cmd = [
@@ -286,6 +348,9 @@ def main() -> None:
             # キーワードリストも子プロセスに渡す（色順序の再現のため）
             if args.keywords:
                 cmd += ["--keywords"] + args.keywords
+            # CLIPクエリも子プロセスに渡す（色順序の再現のため）
+            if args.clip_query:
+                cmd += ["--clip-query"] + args.clip_query
             rc = subprocess.run(cmd, check=False).returncode
             if rc != 0:
                 sys.exit(rc)
@@ -305,6 +370,8 @@ def main() -> None:
             preset=args.preset,
             keyword_hits=keyword_hits,
             keywords=args.keywords,
+            clip_hits=clip_hits,
+            clip_queries=args.clip_query,
         )
 
     # ── 処理時間サマリー ──────────────────────────────────────────────────────
@@ -317,7 +384,10 @@ def main() -> None:
         print(f"  人物検出:             {_format_elapsed(step2_elapsed)}")
         if args.keywords:
             print(f"  音声文字起こし:       {_format_elapsed(step25_elapsed)}")
-            print(f"  ※ 上記2つは並列実行  (直列比 約{step2_elapsed + step25_elapsed:.1f}秒 → 実測 {_format_elapsed(parallel_elapsed)})")
+        if args.clip_query:
+            print(f"  CLIP映像検索:         {_format_elapsed(step_clip_elapsed)}")
+        if len(running) > 1:
+            print(f"  ※ 上記は並列実行     (実測 {_format_elapsed(parallel_elapsed)})")
     if args.no_gui:
         print(f"  カット＆結合:         {_format_elapsed(step3_elapsed)}")
     print(f"  {'─' * 29}")
